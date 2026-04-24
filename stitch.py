@@ -168,52 +168,39 @@ def stitch(images, grid, cols, rows, img_h, img_w):
     # positions[row][col] = (x_offset, y_offset) in canvas coords
     positions = [[None] * cols for _ in range(rows)]
 
-    # Anchor: bottom-left image at (0, 0)
+    # Anchor: bottom-left grid position at (0, 0)
     positions[0][0] = (0, 0)
 
-    print("\n--- Horizontal offsets (same row) ---")
+    # Process row by row: anchor col 0 vertically, then fill row horizontally
     for r in range(rows):
+        # Step 1: anchor col 0 of this row via vertical correlation from row below
+        if r > 0:
+            prev_idx = grid[r - 1][0]
+            curr_idx = grid[r][0]
+            prev_pos = positions[r - 1][0]
+            if prev_idx is not None and curr_idx is not None and prev_pos is not None:
+                _, prev_img = images[prev_idx]
+                _, curr_img = images[curr_idx]
+                init_dy = img_h - overlap_y
+                dx, dy, conf = phase_correlate_pair(prev_img, curr_img, 0, init_dy)
+                positions[r][0] = (prev_pos[0] + int(round(dx)), prev_pos[1] + int(round(dy)))
+                print(f"  col0 row{r-1}→row{r}: dx={dx:.1f} dy={dy:.1f} conf={conf:.4f}")
+
+        # Step 2: fill remaining cols horizontally from col 0
         for c in range(1, cols):
+            prev_pos = positions[r][c - 1]
+            if prev_pos is None:
+                continue
             prev_idx = grid[r][c - 1]
             curr_idx = grid[r][c]
             if prev_idx is None or curr_idx is None:
                 continue
             _, prev_img = images[prev_idx]
             _, curr_img = images[curr_idx]
-            prev_pos = positions[r][c - 1]
-
-            # Expected: current image is to the right of prev by (img_w - overlap_x)
             init_dx = img_w - overlap_x
             dx, dy, conf = phase_correlate_pair(prev_img, curr_img, init_dx, 0)
-            print(f"  row{r} col{c-1}→col{c}: dx={dx:.1f} dy={dy:.1f} conf={conf:.4f}")
             positions[r][c] = (prev_pos[0] + int(round(dx)), prev_pos[1] + int(round(dy)))
-
-    print("\n--- Vertical offsets (same col) ---")
-    for r in range(1, rows):
-        for c in range(cols):
-            prev_idx = grid[r - 1][c]
-            curr_idx = grid[r][c]
-            if prev_idx is None or curr_idx is None:
-                continue
-            _, prev_img = images[prev_idx]
-            _, curr_img = images[curr_idx]
-            prev_pos = positions[r - 1][c]
-            if prev_pos is None:
-                continue
-
-            # Expected: current row is above prev by (img_h - overlap_y)
-            init_dy = img_h - overlap_y
-            dx, dy, conf = phase_correlate_pair(prev_img, curr_img, 0, init_dy)
-            print(f"  col{c} row{r-1}→row{r}: dx={dx:.1f} dy={dy:.1f} conf={conf:.4f}")
-            # Use column anchor from row 0 if this col already has position
-            if positions[r][c] is None:
-                positions[r][c] = (prev_pos[0] + int(round(dx)), prev_pos[1] + int(round(dy)))
-            else:
-                # Average horizontal and vertical estimates
-                hx, hy = positions[r][c]
-                vx = prev_pos[0] + int(round(dx))
-                vy = prev_pos[1] + int(round(dy))
-                positions[r][c] = (hx, (hy + vy) // 2)
+            print(f"  row{r} col{c-1}→col{c}: dx={dx:.1f} dy={dy:.1f} conf={conf:.4f}")
 
     # Compute canvas size
     all_pos = [(x, y) for row in positions for (x, y) in row if (x, y) is not None and x is not None]
@@ -222,21 +209,15 @@ def stitch(images, grid, cols, rows, img_h, img_w):
     max_x = max(p[0] for p in all_pos) + img_w
     max_y = max(p[1] for p in all_pos) + img_h
 
-    # Shift all positions so min is 0
-    positions = [[(x - min_x, y - min_y) if (positions[r][c] is not None) else None
-                  for c, (x, y) in enumerate(row) if True]
-                 for r, row in enumerate(positions)]
-    # rebuild properly
-    shifted = []
-    for r, row in enumerate(positions):
-        sr = []
-        for c in range(cols):
-            if row[c] is not None:
-                sr.append(row[c])
-            else:
-                sr.append(None)
-        shifted.append(sr)
-    positions = shifted
+    # Shift all positions so canvas origin is (0, 0)
+    positions = [
+        [
+            (positions[r][c][0] - min_x, positions[r][c][1] - min_y)
+            if positions[r][c] is not None else None
+            for c in range(cols)
+        ]
+        for r in range(rows)
+    ]
 
     canvas_w = max_x - min_x
     canvas_h = max_y - min_y
