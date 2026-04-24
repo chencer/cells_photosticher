@@ -171,22 +171,34 @@ def stitch(images, grid, cols, rows, img_h, img_w):
     # Anchor: bottom-left grid position at (0, 0)
     positions[0][0] = (0, 0)
 
+    # Snake layout: even rows go right-to-left (col 0 = physical rightmost),
+    #               odd rows go left-to-right (col 0 = physical leftmost).
+    # Vertical neighbor of row r col 0 in row r-1 is always at grid col cols-1
+    # because the physical column of col 0 alternates between rightmost and leftmost,
+    # and in the adjacent row (opposite direction) that physical column maps to cols-1.
+
     # Process row by row: anchor col 0 vertically, then fill row horizontally
     for r in range(rows):
-        # Step 1: anchor col 0 of this row via vertical correlation from row below
+        # Step 1: anchor col 0 of this row via vertical correlation
         if r > 0:
-            prev_idx = grid[r - 1][0]
+            anchor_col_below = cols - 1   # col 0 of row r aligns with col cols-1 of row r-1
+            prev_idx = grid[r - 1][anchor_col_below]
             curr_idx = grid[r][0]
-            prev_pos = positions[r - 1][0]
+            prev_pos = positions[r - 1][anchor_col_below]
             if prev_idx is not None and curr_idx is not None and prev_pos is not None:
                 _, prev_img = images[prev_idx]
                 _, curr_img = images[curr_idx]
                 init_dy = img_h - overlap_y
                 dx, dy, conf = phase_correlate_pair(prev_img, curr_img, 0, init_dy)
                 positions[r][0] = (prev_pos[0] + int(round(dx)), prev_pos[1] + int(round(dy)))
-                print(f"  col0 row{r-1}→row{r}: dx={dx:.1f} dy={dy:.1f} conf={conf:.4f}")
+                print(f"  anchor row{r} col0 from row{r-1} col{anchor_col_below}: dx={dx:.1f} dy={dy:.1f} conf={conf:.4f}")
 
         # Step 2: fill remaining cols horizontally from col 0
+        # Even rows: right-to-left, so next col is to the LEFT → init_dx negative
+        # Odd rows: left-to-right, so next col is to the RIGHT → init_dx positive
+        step = img_w - overlap_x
+        init_dx = -step if r % 2 == 0 else step
+
         for c in range(1, cols):
             prev_pos = positions[r][c - 1]
             if prev_pos is None:
@@ -197,13 +209,12 @@ def stitch(images, grid, cols, rows, img_h, img_w):
                 continue
             _, prev_img = images[prev_idx]
             _, curr_img = images[curr_idx]
-            init_dx = img_w - overlap_x
             dx, dy, conf = phase_correlate_pair(prev_img, curr_img, init_dx, 0)
             positions[r][c] = (prev_pos[0] + int(round(dx)), prev_pos[1] + int(round(dy)))
             print(f"  row{r} col{c-1}→col{c}: dx={dx:.1f} dy={dy:.1f} conf={conf:.4f}")
 
     # Compute canvas size
-    all_pos = [(x, y) for row in positions for (x, y) in row if (x, y) is not None and x is not None]
+    all_pos = [p for row in positions for p in row if p is not None]
     min_x = min(p[0] for p in all_pos)
     min_y = min(p[1] for p in all_pos)
     max_x = max(p[0] for p in all_pos) + img_w
