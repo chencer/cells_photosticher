@@ -91,43 +91,61 @@ def match_centers(centers_a, centers_b, threshold=50):
 
 
 # --- Compute offset between two adjacent images using cellpose centers ---
-# direction: 'h' (img_b is to the right of img_a) or 'v' (img_b is above img_a)
-# Returns (offset_dx, offset_dy, n_matches) where offset is img_b canvas pos - img_a canvas pos
-def compute_offset(img_a, img_b, centers_a, centers_b, img_w, img_h, direction):
+# direction: 'h' or 'v'
+# img_b_right (only for 'h'): True = img_b is to the RIGHT of img_a (odd rows, left-to-right)
+#                              False = img_b is to the LEFT of img_a (even rows, right-to-left)
+# Returns (offset_dx, offset_dy, n_strip) where offset = img_b canvas pos - img_a canvas pos
+def compute_offset(img_a, img_b, centers_a, centers_b, img_w, img_h, direction, img_b_right=True):
     overlap_x = int(img_w * 0.5)
     overlap_y = int(img_h * 0.5)
+    step_x = img_w - overlap_x
+    step_y = img_h - overlap_y
 
     if direction == 'h':
-        # img_b is to the RIGHT of img_a
-        # overlap: right half of img_a, left half of img_b
-        strip_a = centers_a[centers_a[:, 0] >= img_w - overlap_x] if len(centers_a) else centers_a
-        strip_b = centers_b[centers_b[:, 0] < overlap_x] if len(centers_b) else centers_b
-        # Shift strip_a coords to overlap frame (subtract offset from left of img_a's right edge)
-        strip_a_shifted = strip_a - np.array([img_w - overlap_x, 0], dtype=np.float32)
-        result = match_centers(strip_a_shifted, strip_b, threshold=50)
-        if result is None:
-            print(f"    [fallback] <3 matches, using fixed offset")
-            return img_w - overlap_x, 0, 0
-        dx_in_overlap, dy = result
-        n = int((centers_a[:, 0] >= img_w - overlap_x).sum())
-        # Total dx from img_a origin to img_b origin
-        offset_dx = (img_w - overlap_x) + dx_in_overlap
-        return offset_dx, dy, n
+        if img_b_right:
+            # odd rows (left-to-right): img_b is RIGHT of img_a
+            # overlap: right half of img_a ↔ left half of img_b
+            strip_a = centers_a[centers_a[:, 0] >= step_x] if len(centers_a) else centers_a
+            strip_b = centers_b[centers_b[:, 0] < overlap_x] if len(centers_b) else centers_b
+            # shift strip_a into the overlap frame (x: step_x..img_w → 0..overlap_x)
+            strip_a_shifted = strip_a - np.array([step_x, 0], dtype=np.float32)
+            n = int((centers_a[:, 0] >= step_x).sum())
+            result = match_centers(strip_a_shifted, strip_b, threshold=50)
+            if result is None:
+                print(f"    [fallback] n_strip={n}, fixed offset +{step_x}")
+                return step_x, 0, 0
+            dx_residual, dy = result
+            return step_x + dx_residual, dy, n
+        else:
+            # even rows (right-to-left): img_b is LEFT of img_a
+            # overlap: left half of img_a ↔ right half of img_b
+            strip_a = centers_a[centers_a[:, 0] < overlap_x] if len(centers_a) else centers_a
+            strip_b = centers_b[centers_b[:, 0] >= step_x] if len(centers_b) else centers_b
+            # shift strip_b into the overlap frame (x: step_x..img_w → 0..overlap_x)
+            strip_b_shifted = strip_b - np.array([step_x, 0], dtype=np.float32)
+            n = int((centers_a[:, 0] < overlap_x).sum())
+            result = match_centers(strip_a, strip_b_shifted, threshold=50)
+            if result is None:
+                print(f"    [fallback] n_strip={n}, fixed offset -{step_x}")
+                return -step_x, 0, 0
+            # match result = strip_b_shifted - strip_a ≈ 0 (same overlap frame)
+            # canvas offset x_b - x_a = -(step_x) + dx_residual
+            dx_residual, dy = result
+            return -step_x + dx_residual, dy, n
 
-    else:  # 'v': img_b is ABOVE img_a (larger canvas y)
-        # overlap: top half of img_a, bottom half of img_b
+    else:  # 'v': img_b is ABOVE img_a (larger canvas y = rendered below in image)
+        # overlap: top half of img_a ↔ bottom half of img_b
         strip_a = centers_a[centers_a[:, 1] < overlap_y] if len(centers_a) else centers_a
-        strip_b = centers_b[centers_b[:, 1] >= img_h - overlap_y] if len(centers_b) else centers_b
-        # Shift strip_b to overlap frame
-        strip_b_shifted = strip_b - np.array([0, img_h - overlap_y], dtype=np.float32)
+        strip_b = centers_b[centers_b[:, 1] >= step_y] if len(centers_b) else centers_b
+        # shift strip_b into the overlap frame (y: step_y..img_h → 0..overlap_y)
+        strip_b_shifted = strip_b - np.array([0, step_y], dtype=np.float32)
+        n = int((centers_a[:, 1] < overlap_y).sum())
         result = match_centers(strip_a, strip_b_shifted, threshold=50)
         if result is None:
-            print(f"    [fallback] <3 matches, using fixed offset")
-            return 0, img_h - overlap_y, 0
-        dx, dy_in_overlap = result
-        n = int((centers_b[:, 1] >= img_h - overlap_y).sum())
-        offset_dy = (img_h - overlap_y) + dy_in_overlap
-        return dx, offset_dy, n
+            print(f"    [fallback] n_strip={n}, fixed offset +{step_y}")
+            return 0, step_y, 0
+        dx, dy_residual = result
+        return dx, step_y + dy_residual, n
 
 
 # --- Linear blend composite ---
@@ -195,19 +213,16 @@ def stitch(images, grid, cols, rows, img_h, img_w, model, diameter):
 
     print("\n--- Computing positions ---")
 
-    # Row 0: even → right-to-left → each next col is to the LEFT (negative dx)
+    # Row 0: even → right-to-left → img_b (col c) is to the LEFT of img_a (col c-1)
     for c in range(1, cols):
         prev = positions[0][c - 1]
         idx_a, fname_a, img_a = get_img(0, c - 1)
         idx_b, fname_b, img_b = get_img(0, c)
         if img_a is not None and img_b is not None:
-            # img_b is to the LEFT of img_a (even row, right-to-left)
-            # Compute as if img_b is to the right, then negate dx
-            dx, dy, n = compute_offset(img_b, img_a,
-                                       centers_cache[idx_b], centers_cache[idx_a],
-                                       img_w, img_h, 'h')
-            dx, dy = -dx, -dy
-            print(f"  row0 col{c}→col{c-1} (reversed): n={n} dx={dx:.1f} dy={dy:.1f}")
+            dx, dy, n = compute_offset(img_a, img_b,
+                                       centers_cache[idx_a], centers_cache[idx_b],
+                                       img_w, img_h, 'h', img_b_right=False)
+            print(f"  row0 col{c-1}→col{c}: n={n} dx={dx:.1f} dy={dy:.1f}")
         else:
             dx, dy = -step_x, 0
         positions[0][c] = (prev[0] + int(round(dx)), prev[1] + int(round(dy)))
@@ -240,17 +255,10 @@ def stitch(images, grid, cols, rows, img_h, img_w, model, diameter):
             idx_a, _, img_a = get_img(r, c - 1)
             idx_b, _, img_b = get_img(r, c)
             if img_a is not None and img_b is not None:
-                if r % 2 == 0:
-                    # even: img_b is to the LEFT of img_a
-                    dx, dy, n = compute_offset(img_b, img_a,
-                                               centers_cache[idx_b], centers_cache[idx_a],
-                                               img_w, img_h, 'h')
-                    dx, dy = -dx, -dy
-                else:
-                    # odd: img_b is to the RIGHT of img_a
-                    dx, dy, n = compute_offset(img_a, img_b,
-                                               centers_cache[idx_a], centers_cache[idx_b],
-                                               img_w, img_h, 'h')
+                is_right = (r % 2 == 1)  # odd row: img_b to the right; even: to the left
+                dx, dy, n = compute_offset(img_a, img_b,
+                                           centers_cache[idx_a], centers_cache[idx_b],
+                                           img_w, img_h, 'h', img_b_right=is_right)
                 print(f"  row{r} col{c-1}→col{c}: n={n} dx={dx:.1f} dy={dy:.1f}")
             else:
                 dx = -step_x if r % 2 == 0 else step_x
