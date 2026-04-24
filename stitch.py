@@ -76,76 +76,72 @@ def get_centers(img, model, diameter):
 # strip_a: centers in image-a coords, strip_b: centers in image-b coords
 # Returns (dx, dy) offset such that: pos_in_canvas_b = pos_in_canvas_a + (dx, dy)
 #   i.e. matched_b_center ≈ matched_a_center + (dx, dy)
-def match_centers(centers_a, centers_b, threshold=50):
-    if len(centers_a) < 3 or len(centers_b) < 3:
-        return None
-    tree = KDTree(centers_b)
-    dists, idxs = tree.query(centers_a, k=1)
-    mask = dists < threshold
-    if mask.sum() < 3:
-        return None
-    deltas = centers_b[idxs[mask]] - centers_a[mask]
-    dx = float(np.median(deltas[:, 0]))
-    dy = float(np.median(deltas[:, 1]))
-    return dx, dy
-
-
 # --- Compute offset between two adjacent images using cellpose centers ---
-# direction: 'h' or 'v'
-# img_b_right (only for 'h'): True = img_b is to the RIGHT of img_a (odd rows, left-to-right)
-#                              False = img_b is to the LEFT of img_a (even rows, right-to-left)
-# Returns (offset_dx, offset_dy, n_strip) where offset = img_b canvas pos - img_a canvas pos
+# Approach: translate centers_b into img_a's frame using hint offset first,
+# then filter overlap region, then KDTree match within 50px.
+# The 50px threshold measures residual misalignment from hint (not from zero).
+#
+# offset = img_b canvas pos - img_a canvas pos = median(cx_a - cx_b) for matched pairs
+# img_b_right: True = img_b to the RIGHT of img_a (odd rows); False = to the LEFT (even rows)
 def compute_offset(img_a, img_b, centers_a, centers_b, img_w, img_h, direction, img_b_right=True):
-    overlap_x = int(img_w * 0.5)
-    overlap_y = int(img_h * 0.5)
-    step_x = img_w - overlap_x
-    step_y = img_h - overlap_y
+    step_x = img_w // 2
+    step_y = img_h // 2
 
     if direction == 'h':
+        hint_dx = step_x if img_b_right else -step_x
+        # Translate centers_b into img_a coordinate frame
+        b_in_a = centers_b + np.array([hint_dx, 0], dtype=np.float32)
+        # Filter to overlap region in img_a frame
         if img_b_right:
-            # odd rows (left-to-right): img_b is RIGHT of img_a
-            # overlap: right half of img_a ↔ left half of img_b
-            strip_a = centers_a[centers_a[:, 0] >= step_x] if len(centers_a) else centers_a
-            strip_b = centers_b[centers_b[:, 0] < overlap_x] if len(centers_b) else centers_b
-            # shift strip_a into the overlap frame (x: step_x..img_w → 0..overlap_x)
-            strip_a_shifted = strip_a - np.array([step_x, 0], dtype=np.float32)
-            n = int((centers_a[:, 0] >= step_x).sum())
-            result = match_centers(strip_a_shifted, strip_b, threshold=50)
-            if result is None:
-                print(f"    [fallback] n_strip={n}, fixed offset +{step_x}")
-                return step_x, 0, 0
-            dx_residual, dy = result
-            return step_x + dx_residual, dy, n
+            # right half of img_a: x >= step_x
+            mask_a = centers_a[:, 0] >= step_x
+            mask_b = (b_in_a[:, 0] >= step_x) & (b_in_a[:, 0] < img_w)
         else:
-            # even rows (right-to-left): img_b is LEFT of img_a
-            # overlap: left half of img_a ↔ right half of img_b
-            strip_a = centers_a[centers_a[:, 0] < overlap_x] if len(centers_a) else centers_a
-            strip_b = centers_b[centers_b[:, 0] >= step_x] if len(centers_b) else centers_b
-            # shift strip_b into the overlap frame (x: step_x..img_w → 0..overlap_x)
-            strip_b_shifted = strip_b - np.array([step_x, 0], dtype=np.float32)
-            n = int((centers_a[:, 0] < overlap_x).sum())
-            result = match_centers(strip_a, strip_b_shifted, threshold=50)
-            if result is None:
-                print(f"    [fallback] n_strip={n}, fixed offset -{step_x}")
-                return -step_x, 0, 0
-            # match result = strip_b_shifted - strip_a ≈ 0 (same overlap frame)
-            # canvas offset x_b - x_a = -(step_x) + dx_residual
-            dx_residual, dy = result
-            return -step_x + dx_residual, dy, n
+            # left half of img_a: x < step_x
+            mask_a = centers_a[:, 0] < step_x
+            mask_b = (b_in_a[:, 0] >= 0) & (b_in_a[:, 0] < step_x)
+        strip_a = centers_a[mask_a]
+        strip_b_in_a = b_in_a[mask_b]
+        strip_b_orig = centers_b[mask_b]
+        n_strip = int(mask_a.sum())
+        if len(strip_a) < 3 or len(strip_b_in_a) < 3:
+            print(f"    [fallback] n_strip={n_strip} too few, fixed dx={hint_dx}")
+            return hint_dx, 0, 0
+        tree = KDTree(strip_b_in_a)
+        dists, idxs = tree.query(strip_a, k=1)
+        matched = dists < 50
+        if matched.sum() < 3:
+            print(f"    [fallback] n_strip={n_strip} matches={matched.sum()}, fixed dx={hint_dx}")
+            return hint_dx, 0, 0
+        # offset = cx_a - cx_b_orig for matched physical cells (= canvas_x_b - canvas_x_a)
+        offset_dx = float(np.median(strip_a[matched, 0] - strip_b_orig[idxs[matched], 0]))
+        offset_dy = float(np.median(strip_a[matched, 1] - strip_b_orig[idxs[matched], 1]))
+        print(f"    n_strip={n_strip} matches={int(matched.sum())} dx={offset_dx:.1f} dy={offset_dy:.1f}")
+        return offset_dx, offset_dy, int(matched.sum())
 
-    else:  # 'v': img_b is ABOVE img_a (larger canvas y = rendered below in image)
-        # overlap: top half of img_a ↔ bottom half of img_b
-        strip_a = centers_a[centers_a[:, 1] < overlap_y] if len(centers_a) else centers_a
-        strip_b = centers_b[centers_b[:, 1] >= step_y] if len(centers_b) else centers_b
-        # shift strip_b into the overlap frame (y: step_y..img_h → 0..overlap_y)
-        strip_b_shifted = strip_b - np.array([0, step_y], dtype=np.float32)
-        n = int((centers_a[:, 1] < overlap_y).sum())
-        result = match_centers(strip_a, strip_b_shifted, threshold=50)
-        if result is None:
-            print(f"    [fallback] n_strip={n}, fixed offset +{step_y}")
-            return 0, step_y, 0
-        dx, dy_residual = result
-        return dx, step_y + dy_residual, n
+    else:  # 'v': img_b at canvas_y_b = canvas_y_a + step_y
+        # Overlap: bottom of img_a (y >= step_y) ↔ top of img_b (y_b < step_y → y_b_in_a < 2*step_y)
+        hint_dy = step_y
+        b_in_a = centers_b + np.array([0, hint_dy], dtype=np.float32)
+        mask_a = centers_a[:, 1] >= step_y
+        mask_b = (b_in_a[:, 1] >= step_y) & (b_in_a[:, 1] < img_h)
+        strip_a = centers_a[mask_a]
+        strip_b_in_a = b_in_a[mask_b]
+        strip_b_orig = centers_b[mask_b]
+        n_strip = int(mask_a.sum())
+        if len(strip_a) < 3 or len(strip_b_in_a) < 3:
+            print(f"    [fallback] n_strip={n_strip} too few, fixed dy={hint_dy}")
+            return 0, hint_dy, 0
+        tree = KDTree(strip_b_in_a)
+        dists, idxs = tree.query(strip_a, k=1)
+        matched = dists < 50
+        if matched.sum() < 3:
+            print(f"    [fallback] n_strip={n_strip} matches={matched.sum()}, fixed dy={hint_dy}")
+            return 0, hint_dy, 0
+        offset_dx = float(np.median(strip_a[matched, 0] - strip_b_orig[idxs[matched], 0]))
+        offset_dy = float(np.median(strip_a[matched, 1] - strip_b_orig[idxs[matched], 1]))
+        print(f"    n_strip={n_strip} matches={int(matched.sum())} dx={offset_dx:.1f} dy={offset_dy:.1f}")
+        return offset_dx, offset_dy, int(matched.sum())
 
 
 # --- Linear blend composite ---
