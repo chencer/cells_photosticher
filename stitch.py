@@ -159,80 +159,102 @@ def linear_blend(canvas, img, x_off, y_off, overlap_x, overlap_y):
     canvas[y0:y1, x0:x1] = np.clip(blended, 0, 255).astype(np.uint8)
 
 
+# --- Snake grid physical column helpers ---
+# build_grid convention:
+#   even row r: images reversed → grid[r][c] is at physical col (cols-1-c)
+#   odd  row r: images in order → grid[r][c] is at physical col c
+#
+# Vertical neighbor formula:
+#   For grid[r][c], its physically aligned cell in row r-1 is at grid[r-1][cols-1-c].
+#   Proof: phys = (cols-1-c) if r%2==0 else c
+#          In row r-1 (opposite parity):
+#            if r-1 even: grid_col = cols-1-phys = cols-1-(cols-1-c) = c  → but parity flipped so it's cols-1-c... let's verify by cases:
+#
+#   r=1(odd),c=0: phys=0. r-1=0(even): grid_col = cols-1-phys = cols-1. → cols-1-c = cols-1. ✓
+#   r=2(even),c=0: phys=cols-1. r-1=1(odd): grid_col = phys = cols-1. → cols-1-c = cols-1. ✓
+#   r=1(odd),c=5: phys=5. r-1=0(even): grid_col = cols-1-5. → cols-1-c = cols-1-5. ✓
+#   r=2(even),c=5: phys=cols-1-5. r-1=1(odd): grid_col = cols-1-5. → cols-1-c = cols-1-5. ✓
+#
+# Result: vertical neighbor of grid[r][c] in row r-1 is always grid[r-1][cols-1-c].
+
+
 # --- Main stitching ---
 def stitch(images, grid, cols, rows, img_h, img_w):
-    overlap_x = img_w // 2   # ~1024px
-    overlap_y = img_h // 2   # ~540px
+    step_x = img_w // 2   # horizontal step ≈ half image width (~1024px)
+    step_y = img_h // 2   # vertical step ≈ half image height (~540px)
 
-    # Compute per-image absolute positions via phase correlation
-    # positions[row][col] = (x_offset, y_offset) in canvas coords
+    # positions[r][c] = (x, y) canvas offset, None if not yet placed
     positions = [[None] * cols for _ in range(rows)]
 
-    # Anchor: bottom-left grid position at (0, 0)
+    def get_img(r, c):
+        idx = grid[r][c]
+        return images[idx][1] if idx is not None else None
+
+    # --- Row 0: anchor col 0, fill horizontally ---
+    # Even row → right-to-left → each successive col is to the LEFT → dx hint negative
     positions[0][0] = (0, 0)
+    for c in range(1, cols):
+        prev = positions[0][c - 1]          # guaranteed not None: filled sequentially
+        a = get_img(0, c - 1)
+        b = get_img(0, c)
+        if a is not None and b is not None:
+            dx, dy, conf = phase_correlate_pair(a, b, -step_x, 0)
+            print(f"  row0 col{c-1}→col{c}: dx={dx:.1f} dy={dy:.1f} conf={conf:.4f}")
+        else:
+            dx, dy = -step_x, 0            # geometric fallback
+        positions[0][c] = (prev[0] + int(round(dx)), prev[1] + int(round(dy)))
 
-    # Snake layout: even rows go right-to-left (col 0 = physical rightmost),
-    #               odd rows go left-to-right (col 0 = physical leftmost).
-    # Vertical neighbor of row r col 0 in row r-1 is always at grid col cols-1
-    # because the physical column of col 0 alternates between rightmost and leftmost,
-    # and in the adjacent row (opposite direction) that physical column maps to cols-1.
+    # --- Rows 1..rows-1 ---
+    for r in range(1, rows):
+        # Step 1: anchor col 0 via vertical phase correlation.
+        # Vertical neighbor of grid[r][0] in row r-1 is always at col cols-1-0 = cols-1.
+        below_c = cols - 1
+        prev = positions[r - 1][below_c]    # set during previous row's horizontal fill
+        a = get_img(r - 1, below_c)
+        b = get_img(r, 0)
+        if prev is None:
+            # Should not happen if row r-1 was filled fully; guard anyway
+            print(f"  [warn] row{r} col0: anchor at row{r-1} col{below_c} is None, using geometric estimate")
+            ref = next((p for p in positions[r - 1] if p is not None), None)
+            prev = ref if ref is not None else (0, (r) * step_y)
+        if a is not None and b is not None:
+            dx, dy, conf = phase_correlate_pair(a, b, 0, step_y)
+            print(f"  row{r} col0 ← row{r-1} col{below_c}: dx={dx:.1f} dy={dy:.1f} conf={conf:.4f}")
+        else:
+            dx, dy = 0, step_y             # geometric fallback
+        positions[r][0] = (prev[0] + int(round(dx)), prev[1] + int(round(dy)))
 
-    # Process row by row: anchor col 0 vertically, then fill row horizontally
-    for r in range(rows):
-        # Step 1: anchor col 0 of this row via vertical correlation
-        if r > 0:
-            anchor_col_below = cols - 1   # col 0 of row r aligns with col cols-1 of row r-1
-            prev_idx = grid[r - 1][anchor_col_below]
-            curr_idx = grid[r][0]
-            prev_pos = positions[r - 1][anchor_col_below]
-            if prev_idx is not None and curr_idx is not None and prev_pos is not None:
-                _, prev_img = images[prev_idx]
-                _, curr_img = images[curr_idx]
-                init_dy = img_h - overlap_y
-                dx, dy, conf = phase_correlate_pair(prev_img, curr_img, 0, init_dy)
-                positions[r][0] = (prev_pos[0] + int(round(dx)), prev_pos[1] + int(round(dy)))
-                print(f"  anchor row{r} col0 from row{r-1} col{anchor_col_below}: dx={dx:.1f} dy={dy:.1f} conf={conf:.4f}")
-
-        # Step 2: fill remaining cols horizontally from col 0
-        # Even rows: right-to-left, so next col is to the LEFT → init_dx negative
-        # Odd rows: left-to-right, so next col is to the RIGHT → init_dx positive
-        step = img_w - overlap_x
-        init_dx = -step if r % 2 == 0 else step
-
+        # Step 2: fill remaining cols horizontally.
+        # Even row → right-to-left (dx hint negative); odd row → left-to-right (positive).
+        hint_dx = -step_x if r % 2 == 0 else step_x
         for c in range(1, cols):
-            prev_pos = positions[r][c - 1]
-            if prev_pos is None:
-                continue
-            prev_idx = grid[r][c - 1]
-            curr_idx = grid[r][c]
-            if prev_idx is None or curr_idx is None:
-                continue
-            _, prev_img = images[prev_idx]
-            _, curr_img = images[curr_idx]
-            dx, dy, conf = phase_correlate_pair(prev_img, curr_img, init_dx, 0)
-            positions[r][c] = (prev_pos[0] + int(round(dx)), prev_pos[1] + int(round(dy)))
-            print(f"  row{r} col{c-1}→col{c}: dx={dx:.1f} dy={dy:.1f} conf={conf:.4f}")
+            prev = positions[r][c - 1]     # set in previous iteration of this loop
+            a = get_img(r, c - 1)
+            b = get_img(r, c)
+            if a is not None and b is not None:
+                dx, dy, conf = phase_correlate_pair(a, b, hint_dx, 0)
+                print(f"  row{r} col{c-1}→col{c}: dx={dx:.1f} dy={dy:.1f} conf={conf:.4f}")
+            else:
+                dx, dy = hint_dx, 0        # geometric fallback
+            positions[r][c] = (prev[0] + int(round(dx)), prev[1] + int(round(dy)))
 
-    # Compute canvas size
+    # --- Compute canvas bounds and normalize to (0, 0) ---
     all_pos = [p for row in positions for p in row if p is not None]
+    if not all_pos:
+        raise RuntimeError("No positions computed — check that images loaded correctly")
     min_x = min(p[0] for p in all_pos)
     min_y = min(p[1] for p in all_pos)
     max_x = max(p[0] for p in all_pos) + img_w
     max_y = max(p[1] for p in all_pos) + img_h
 
-    # Shift all positions so canvas origin is (0, 0)
     positions = [
-        [
-            (positions[r][c][0] - min_x, positions[r][c][1] - min_y)
-            if positions[r][c] is not None else None
-            for c in range(cols)
-        ]
-        for r in range(rows)
+        [(p[0] - min_x, p[1] - min_y) if p is not None else None for p in row]
+        for row in positions
     ]
 
     canvas_w = max_x - min_x
     canvas_h = max_y - min_y
-    print(f"\nCanvas size: {canvas_w} x {canvas_h}")
+    print(f"\nCanvas: {canvas_w}×{canvas_h} px")
 
     canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
 
@@ -247,8 +269,8 @@ def stitch(images, grid, cols, rows, img_h, img_w):
                 continue
             fname, img = images[idx]
             x_off, y_off = pos
-            print(f"  placing row{r} col{c} ({fname}) at ({x_off}, {y_off})")
-            linear_blend(canvas, img, x_off, y_off, overlap_x, overlap_y)
+            print(f"  place row{r} col{c} ({fname}) at ({x_off}, {y_off})")
+            linear_blend(canvas, img, x_off, y_off, step_x, step_y)
 
     return canvas
 
